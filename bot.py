@@ -581,7 +581,6 @@ async def send_movie(bot: Bot, chat_id: int, movie: Dict, user_id: int):
                     width=movie.get('width') or None,
                     height=movie.get('height') or None,
                     duration=movie.get('duration') or None,
-                    thumbnail=movie.get('thumb_id') or None,
                     supports_streaming=True
                 )
             except TelegramBadRequest:
