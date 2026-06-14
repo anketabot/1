@@ -76,17 +76,16 @@ class Database:
                     year INTEGER DEFAULT 0, genre TEXT DEFAULT 'Noma''lum',
                     description TEXT DEFAULT '', file_id TEXT NOT NULL,
                     poster_id TEXT, views INTEGER DEFAULT 0,
-                    file_type TEXT DEFAULT 'video',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, added_by BIGINT
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, added_by BIGINT,
+                    width INTEGER DEFAULT 0, height INTEGER DEFAULT 0,
+                    duration INTEGER DEFAULT 0, thumb_id TEXT
                 )
             """)
-            # Mavjud jadvalga file_type ustunini qo'shish (migration)
-            try:
-                await conn.execute("""
-                    ALTER TABLE movies ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT 'video'
-                """)
-            except Exception:
-                pass
+            # Eski bazalarda ustunlar bo'lmasa, qo'shib qo'yamiz
+            await conn.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS width INTEGER DEFAULT 0")
+            await conn.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS height INTEGER DEFAULT 0")
+            await conn.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS duration INTEGER DEFAULT 0")
+            await conn.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS thumb_id TEXT")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id BIGINT, movie_id INTEGER,
@@ -166,13 +165,16 @@ class Database:
 
     async def add_movie(self, code: str, name: str, year: int, genre: str,
                         description: str, file_id: str, poster_id: Optional[str],
-                        added_by: int, file_type: str = 'video') -> bool:
+                        added_by: int, width: int = 0, height: int = 0,
+                        duration: int = 0, thumb_id: Optional[str] = None) -> bool:
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO movies (code, name, year, genre, description, file_id, poster_id, added_by, file_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """, code, name, year, genre, description, file_id, poster_id, added_by, file_type)
+                    INSERT INTO movies (code, name, year, genre, description, file_id, poster_id, added_by,
+                                        width, height, duration, thumb_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                """, code, name, year, genre, description, file_id, poster_id, added_by,
+                     width, height, duration, thumb_id)
                 return True
         except asyncpg.UniqueViolationError:
             return False
@@ -565,29 +567,22 @@ async def send_movie(bot: Bot, chat_id: int, movie: Dict, user_id: int):
     )
 
     try:
-        # Video yoki document faylni caption bilan BIRGA yuborish
-        file_type = movie.get('file_type', 'video')
+        # Video faylni caption bilan BIRGA yuborish
         if movie.get('file_id'):
-            if file_type == 'document':
-                # MKV yoki boshqa document fayllar
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=movie['file_id'],
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb
-                )
-            else:
-                # Oddiy video (mp4 va boshqalar)
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=movie['file_id'],
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb
-                )
+            await bot.send_video(
+                chat_id=chat_id,
+                video=movie['file_id'],
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                width=movie.get('width') or None,
+                height=movie.get('height') or None,
+                duration=movie.get('duration') or None,
+                thumbnail=movie.get('thumb_id') or None,
+                supports_streaming=True
+            )
         else:
-            # Fayl yo'q bo'lsa, faqat matn yuborish
+            # Video yo'q bo'lsa, faqat matn yuborish
             await bot.send_message(
                 chat_id=chat_id,
                 text=caption,
@@ -863,65 +858,31 @@ async def process_add_description(message: Message, state: FSMContext):
     await state.set_state(AdminStates.add_video)
     await message.answer(
         "🎥 Kino video faylini yuboring:\n\n"
-        "📌 <b>Qabul qilinadigan usullar:</b>\n"
-        "• <b>Video sifatida</b> yuborish → MP4 (Telegram kompressiya qiladi)\n"
-        "• <b>Fayl sifatida</b> yuborish → MKV, AVI, MOV, WMV, WEBM\n\n"
-        "<i>MKV faylni yuklash uchun: 📎 → Fayl → MKV faylni tanlang</i>",
-        parse_mode=ParseMode.HTML
+        "<i>Video faylni to'g'ridan-to'g'ri yuboring.</i>"
     )
 
 
 @router.message(AdminStates.add_video, F.video)
 async def process_add_video(message: Message, state: FSMContext):
-    file_id = message.video.file_id
-    await state.update_data(file_id=file_id, file_type='video')
+    video = message.video
+    await state.update_data(
+        file_id=video.file_id,
+        width=video.width or 0,
+        height=video.height or 0,
+        duration=video.duration or 0,
+        thumb_id=video.thumbnail.file_id if video.thumbnail else None
+    )
     await finish_add_movie(message, state)
-
-
-@router.message(AdminStates.add_video, F.document)
-async def process_add_video_document(message: Message, state: FSMContext):
-    """MKV va boshqa document formatdagi video fayllarni qabul qilish"""
-    doc = message.document
-    mime = doc.mime_type or ""
-    file_name = doc.file_name or ""
-    # Video formatlarini tekshirish
-    allowed_mimes = ['video/', 'application/x-matroska']
-    allowed_exts = ['.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mp4', '.m4v']
-    ext = os.path.splitext(file_name)[1].lower()
-
-    if any(mime.startswith(m) for m in allowed_mimes) or ext in allowed_exts:
-        file_id = doc.file_id
-        await state.update_data(file_id=file_id, file_type='document')
-        await message.answer(
-            f"✅ <b>{file_name}</b> fayli qabul qilindi!\n"
-            f"📦 Format: document (MKV/video fayl)",
-            parse_mode=ParseMode.HTML
-        )
-        await finish_add_movie(message, state)
-    else:
-        await message.answer(
-            "❌ Bu fayl video format emas!\n"
-            "Qabul qilinadigan formatlar: <b>MKV, MP4, AVI, MOV, WMV, WEBM</b>\n"
-            "Yoki video sifatida yuboring.",
-            parse_mode=ParseMode.HTML
-        )
 
 
 @router.message(AdminStates.add_video)
 async def process_add_video_invalid(message: Message):
-    await message.answer(
-        "❌ Iltimos, video fayl yuboring!\n\n"
-        "📌 <b>Qabul qilinadigan usullar:</b>\n"
-        "• Video sifatida yuborish (MP4)\n"
-        "• Fayl sifatida yuborish (MKV, AVI, MOV va boshqalar)",
-        parse_mode=ParseMode.HTML
-    )
+    await message.answer("❌ Iltimos, video fayl yuboring!")
 
 
 async def finish_add_movie(message: Message, state: FSMContext):
     data = await state.get_data()
     admin_id = message.from_user.id
-    file_type = data.get('file_type', 'video')
 
     success = await db.add_movie(
         code=data['code'],
@@ -932,7 +893,10 @@ async def finish_add_movie(message: Message, state: FSMContext):
         file_id=data['file_id'],
         poster_id=None,
         added_by=admin_id,
-        file_type=file_type
+        width=data.get('width', 0),
+        height=data.get('height', 0),
+        duration=data.get('duration', 0),
+        thumb_id=data.get('thumb_id')
     )
 
     if success:
@@ -1058,12 +1022,10 @@ async def process_series_descriptions(message: Message, state: FSMContext):
 async def process_series_videos(message: Message, state: FSMContext):
     data = await state.get_data()
     videos = data['series_videos']
-    video_types = data.get('series_video_types', [])
     videos.append(message.video.file_id)
-    video_types.append('video')
     count = data['series_count']
     idx = len(videos)
-    await state.update_data(series_videos=videos, series_video_types=video_types)
+    await state.update_data(series_videos=videos)
 
     if idx < count:
         await message.answer(f"🎥 <b>{idx + 1}/{count}-qism video faylini yuboring:</b>",
@@ -1072,52 +1034,9 @@ async def process_series_videos(message: Message, state: FSMContext):
         await finish_add_series(message, state)
 
 
-@router.message(AdminStates.series_videos, F.document)
-async def process_series_videos_document(message: Message, state: FSMContext):
-    """Serial uchun MKV va boshqa document formatdagi video fayllar"""
-    doc = message.document
-    mime = doc.mime_type or ""
-    file_name = doc.file_name or ""
-    allowed_mimes = ['video/', 'application/x-matroska']
-    allowed_exts = ['.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mp4', '.m4v']
-    ext = os.path.splitext(file_name)[1].lower()
-
-    data = await state.get_data()
-    count = data['series_count']
-
-    if any(mime.startswith(m) for m in allowed_mimes) or ext in allowed_exts:
-        videos = data['series_videos']
-        video_types = data.get('series_video_types', [])
-        videos.append(doc.file_id)
-        video_types.append('document')
-        idx = len(videos)
-        await state.update_data(series_videos=videos, series_video_types=video_types)
-        await message.answer(
-            f"✅ <b>{file_name}</b> ({idx}/{count}) qabul qilindi!",
-            parse_mode=ParseMode.HTML
-        )
-        if idx < count:
-            await message.answer(f"🎥 <b>{idx + 1}/{count}-qism video faylini yuboring:</b>",
-                                  parse_mode=ParseMode.HTML)
-        else:
-            await finish_add_series(message, state)
-    else:
-        await message.answer(
-            "❌ Bu fayl video format emas!\n"
-            "Qabul qilinadigan formatlar: <b>MKV, MP4, AVI, MOV, WMV, WEBM</b>",
-            parse_mode=ParseMode.HTML
-        )
-
-
 @router.message(AdminStates.series_videos)
 async def process_series_videos_invalid(message: Message):
-    await message.answer(
-        "❌ Iltimos, video fayl yuboring!\n\n"
-        "📌 <b>Qabul qilinadigan usullar:</b>\n"
-        "• Video sifatida yuborish (MP4)\n"
-        "• Fayl sifatida yuborish (MKV, AVI, MOV va boshqalar)",
-        parse_mode=ParseMode.HTML
-    )
+    await message.answer("❌ Iltimos, video fayl yuboring!")
 
 
 async def finish_add_series(message: Message, state: FSMContext):
@@ -1128,13 +1047,11 @@ async def finish_add_series(message: Message, state: FSMContext):
     base_name = data['series_base_name']
     descs = data['series_descs']
     videos = data['series_videos']
-    video_types = data.get('series_video_types', ['video'] * count)
 
     added = 0
     failed_codes = []
     for i in range(count):
         part_name = base_name
-        ftype = video_types[i] if i < len(video_types) else 'video'
         success = await db.add_movie(
             code=codes[i],
             name=part_name,
@@ -1143,8 +1060,7 @@ async def finish_add_series(message: Message, state: FSMContext):
             description=descs[i],
             file_id=videos[i],
             poster_id=None,
-            added_by=admin_id,
-            file_type=ftype
+            added_by=admin_id
         )
         if success:
             added += 1
